@@ -264,11 +264,14 @@ async function goToLocation() {
             address = geocodeResult.address;
         }
         
-        // Update map center (this will trigger moveend, but is_programmatic_move prevents input update)
-        map.leaflet.setView([lat, lng], map.zoom);
+        // Update map center and zoom in to show the location better
+        // Use zoom level 15 for a closer view of the location
+        const zoomLevel = 15;
+        map.leaflet.setView([lat, lng], zoomLevel);
         map.center.lat = lat;
         map.center.lng = lng;
         map.center.address = address;
+        map.zoom = zoomLevel; // Update the stored zoom level
         
         // Update input with the resolved address or coordinates
         location_input.value = address || `${lat.toFixed(6)}, ${lng.toFixed(6)}`;

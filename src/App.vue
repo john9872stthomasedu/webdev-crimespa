@@ -7,6 +7,14 @@ let location_input = ref('');
 let is_programmatic_move = ref(false);
 let user_has_interacted = ref(false);
 
+// --- lookup / crimes state (added) ---
+let codes_by_code = ref({});
+let neighborhoods_by_id = ref({});
+let crimes = ref([]);
+let neighborhood_crime_counts = ref({});
+let selected_crime_marker = ref(null);
+let selected_crime_id = ref(null);
+
 // New incident form data
 let incident_form = reactive({
     date: '',

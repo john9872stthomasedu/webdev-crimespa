@@ -103,9 +103,140 @@ onMounted(() => {
 
 // FUNCTIONS
 // Function called once user has entered REST API URL
-function initializeCrimes() {
-    // TODO: get code and neighborhood data
-    //       get initial 1000 crimes
+async function initializeCrimes() {
+    if (!crime_url.value) {
+        console.warn('initializeCrimes: crime_url not set');
+        return;
+    }
+
+    const base = String(crime_url.value).replace(/\/$/, '');
+    try {
+        // Fetch lookups 
+        let codesArr = [];
+        let nbhArr = [];
+        try {
+            const [codesResp, nbhResp] = await Promise.all([
+                fetch(`${base}/codes`),
+                fetch(`${base}/neighborhoods`)
+            ]);
+            if (codesResp.ok) codesArr = await codesResp.json() || [];
+            else console.warn('/codes returned', codesResp.status);
+
+            if (nbhResp.ok) nbhArr = await nbhResp.json() || [];
+            else console.warn('/neighborhoods returned', nbhResp.status);
+        } catch (e) {
+            console.warn('Lookup fetch error (continuing):', e);
+        }
+
+        // Build lookup maps
+        const codeMap = {};
+        if (Array.isArray(codesArr)) {
+            codesArr.forEach(c => {
+                if (c && (c.code != null)) codeMap[String(c.code)] = c.incident_type ?? c.incident_type_description ?? c.incident ?? '';
+            });
+        }
+
+        const nbhMap = {};
+        if (Array.isArray(nbhArr)) {
+            nbhArr.forEach(n => {
+                const id = n.id ?? n.neighborhood_number ?? n.neighborhood_id;
+                const name = n.neighborhood_name ?? n.name;
+                if (id != null) nbhMap[String(id)] = name ?? '';
+            });
+        }
+
+        codes_by_code.value = codeMap;
+        neighborhoods_by_id.value = nbhMap;
+
+        // Compute bbox safely 
+        let lat_min = 44.90, lat_max = 45.01, lng_min = -93.25, lng_max = -92.99;
+        try {
+            if (map && map.leaflet && typeof map.leaflet.getBounds === 'function') {
+                const b = map.leaflet.getBounds();
+                lat_min = b.getSouth();
+                lat_max = b.getNorth();
+                lng_min = b.getWest();
+                lng_max = b.getEast();
+            } else if (map && map.bounds) {
+                // older fallback shape in your code
+                lat_min = map.bounds.se?.lat ?? lat_min;
+                lat_max = map.bounds.nw?.lat ?? lat_max;
+                lng_min = map.bounds.nw?.lng ?? lng_min;
+                lng_max = map.bounds.se?.lng ?? lng_max;
+            }
+        } catch (e) {
+            console.warn('BBox calc failed, using defaults:', e);
+        }
+
+        // Request incidents 
+        const params = new URLSearchParams({
+            limit: '1000',
+            lat_min: String(lat_min),
+            lat_max: String(lat_max),
+            lng_min: String(lng_min),
+            lng_max: String(lng_max)
+        });
+
+        const incidentsResp = await fetch(`${base}/incidents?${params.toString()}`);
+        if (!incidentsResp.ok) {
+            throw new Error(`/incidents returned status ${incidentsResp.status}`);
+        }
+
+        const incidentsJson = await incidentsResp.json();
+        const incidents = Array.isArray(incidentsJson) ? incidentsJson : (incidentsJson.incidents || []);
+
+        // Normalize rows
+        const rows = incidents.map(i => {
+            const codeKey = String(i.code ?? i.crime_code ?? '');
+            const nbhKey = String(i.neighborhood_number ?? i.neighborhood ?? i.neighborhood_id ?? '');
+            return {
+                id: i.id ?? i.case_number ?? i.case ?? null,
+                case_number: i.case_number ?? i.case ?? '',
+                date: i.date ?? '',
+                time: i.time ?? '',
+                incident_type: codeMap[codeKey] || i.incident_type || i.incident || codeKey,
+                neighborhood_number: nbhKey,
+                neighborhood_name: nbhMap[nbhKey] || i.neighborhood_name || '',
+                block: i.block ?? i.address ?? '',
+                latitude: i.latitude ?? i.lat ?? null,
+                longitude: i.longitude ?? i.lng ?? null,
+                raw: i
+            };
+        });
+
+        // Sort newest first 
+        rows.sort((a, b) => {
+            const at = Date.parse(`${a.date}T${a.time || '00:00:00'}`);
+            const bt = Date.parse(`${b.date}T${b.time || '00:00:00'}`);
+            if (Number.isNaN(at) || Number.isNaN(bt)) return 0;
+            return bt - at;
+        });
+
+        crimes.value = rows;
+
+        // Counts per neighborhood
+        const counts = {};
+        rows.forEach(r => {
+            const id = String(r.neighborhood_number ?? '');
+            if (!id) return;
+            counts[id] = (counts[id] || 0) + 1;
+        });
+        neighborhood_crime_counts.value = counts;
+
+        // Draw/update markers safely
+        try {
+            drawNeighborhoodMarkers();
+            updateNeighborhoodMarkerPopups();
+        } catch (e) {
+            console.warn('Marker draw/update failed (non-fatal):', e);
+        }
+
+        console.info(`initializeCrimes: loaded ${rows.length} incidents`);
+    } catch (err) {
+        console.error('initializeCrimes error:', err);
+        // don't rethrow — surface a friendly alert and keep the UI alive
+        alert('Failed to load incidents: ' + (err.message || String(err)));
+    }
 }
 
 // Function called when user presses 'OK' on dialog box

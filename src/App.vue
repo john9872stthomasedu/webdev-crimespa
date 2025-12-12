@@ -118,21 +118,42 @@ onMounted(() => {
 function initializeCrimes() {
     // Retrieve code + neighborhood data, then fetch 1,000 most recent incidents
     // and display ONLY the ones within the current map viewport.
-    if (!crime_url.value || !map.leaflet) return;
+    if (!map.leaflet) return;
 
-    const base = crime_url.value.replace(/\/$/, '');
-    const api = (p) => `${base}${p}`;
+    // Allow blank URL (same-origin) and tolerate inputs like "localhost:8000"
+    // or "http://localhost:8000/".
+    let baseInput = (crime_url.value ?? '').trim();
+    if (baseInput === '') {
+        baseInput = ''; // same-origin
+    } else if (!/^https?:\/\//i.test(baseInput)) {
+        // If user typed "localhost:8000" or "127.0.0.1:8000", prepend scheme.
+        baseInput = `http://${baseInput}`;
+    }
+    const base = baseInput.replace(/\/$/, '');
+    const api = (p) => (base ? `${base}${p}` : p);
 
     async function fetchJson(url) {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-            throw new Error(`Request failed (${resp.status} ${resp.statusText}) for ${url}`);
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                throw new Error(`Request failed (${resp.status} ${resp.statusText}) for ${url}`);
+            }
+            return await resp.json();
+        } catch (err) {
+            // Browser throws TypeError: Failed to fetch for network/CORS/HTTPS issues.
+            if (String(err?.message ?? err).toLowerCase().includes('failed to fetch')) {
+                throw new Error(
+                    `Failed to fetch ${url}. ` +
+                    `Make sure the API URL is correct (try "http://localhost:8000" or leave it blank for same-origin), ` +
+                    `and that node rest_server.mjs is running.`
+                );
+            }
+            throw err;
         }
-        return await resp.json();
     }
 
     function getViewportBBox() {
-        // NW + SE corners of the visible map 
+        // NW + SE corners of the visible map (hint from assignment)
         const b = map.leaflet.getBounds();
         const nw = b.getNorthWest();
         const se = b.getSouthEast();
@@ -198,7 +219,7 @@ function initializeCrimes() {
             counts.set(n, (counts.get(n) ?? 0) + 1);
         }
 
-        // Create or update a marker per neighborhood.
+        // Create or update a marker per neighborhood (using the provided marker locations list).
         map.neighborhood_markers.forEach((m, idx) => {
             const neighborhood_number = idx + 1; // assumes 1..17 in order
             const name =
@@ -299,7 +320,7 @@ function initializeCrimes() {
 function closeDialog() {
     let dialog = document.getElementById('rest-dialog');
     let url_input = document.getElementById('dialog-url');
-    if (crime_url.value !== '' && url_input.checkValidity()) {
+    if (url_input.checkValidity()) {
         dialog_err.value = false;
         dialog.close();
         initializeCrimes();
@@ -452,7 +473,7 @@ async function goToLocation() {
         }
         
         // Update map center and zoom in to show the location better
-
+        // Use zoom level 15 for a closer view of the location
         const zoomLevel = 15;
         map.leaflet.setView([lat, lng], zoomLevel);
         map.center.lat = lat;
@@ -475,7 +496,7 @@ async function goToLocation() {
     }
 }
 
-// Update location input from current map center 
+// Update location input from current map center (only called after user manually pans/zooms)
 async function updateLocationInputFromMap() {
     if (!map.leaflet) return;
     

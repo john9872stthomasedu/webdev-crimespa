@@ -7,13 +7,17 @@ let location_input = ref('');
 let is_programmatic_move = ref(false);
 let user_has_interacted = ref(false);
 
-// --- lookup / crimes state (added) ---
-let codes_by_code = ref({});
-let neighborhoods_by_id = ref({});
-let crimes = ref([]);
-let neighborhood_crime_counts = ref({});
-let selected_crime_marker = ref(null);
-let selected_crime_id = ref(null);
+// Crime data for table + markers
+let codes_by_id = ref(new Map());              // code -> incident_type
+let neighborhoods_by_id = ref(new Map());      // neighborhood_number -> neighborhood_name
+let crimes = ref([]);                          // incidents filtered to map viewport
+let crimes_loading = ref(false);
+let crimes_error = ref('');
+let crimes_limit = ref(1000);
+
+// internal: keep from double-binding map listeners
+let crimes_map_listeners_added = ref(false);
+
 
 // New incident form data
 let incident_form = reactive({
@@ -111,75 +115,184 @@ onMounted(() => {
 
 // FUNCTIONS
 // Function called once user has entered REST API URL
-async function initializeCrimes() {
-    // Ensure the REST base URL exists
-    if (!crime_url || !crime_url.value) {
-        console.warn('initializeCrimes: crime_url not set');
-        return;
-    }
-    const base = String(crime_url.value).replace(/\/$/, '');
-    console.info('initializeCrimes: using base URL', base);
+function initializeCrimes() {
+    // Retrieve code + neighborhood data, then fetch 1,000 most recent incidents
+    // and display ONLY the ones within the current map viewport.
+    if (!crime_url.value || !map.leaflet) return;
 
-    // Compute bbox safely (fallbacks)
-    let lat_min = 44.90, lat_max = 45.01, lng_min = -93.25, lng_max = -92.99;
-    try {
-        if (map && map.leaflet && typeof map.leaflet.getBounds === 'function') {
-            const b = map.leaflet.getBounds();
-            lat_min = b.getSouth();
-            lat_max = b.getNorth();
-            lng_min = b.getWest();
-            lng_max = b.getEast();
-        } else if (map && map.bounds) {
-            lat_min = map.bounds.se?.lat ?? lat_min;
-            lat_max = map.bounds.nw?.lat ?? lat_max;
-            lng_min = map.bounds.nw?.lng ?? lng_min;
-            lng_max = map.bounds.se?.lng ?? lng_max;
-        }
-    } catch (e) {
-        console.warn('BBox calc failed, using defaults:', e);
-    }
+    const base = crime_url.value.replace(/\/$/, '');
+    const api = (p) => `${base}${p}`;
 
-    const params = new URLSearchParams({
-        limit: '1000',
-        lat_min: String(lat_min),
-        lat_max: String(lat_max),
-        lng_min: String(lng_min),
-        lng_max: String(lng_max)
-    });
-
-    const url = `${base}/incidents?${params.toString()}`;
-    console.info('initializeCrimes: requesting', url);
-
-    try {
+    async function fetchJson(url) {
         const resp = await fetch(url);
         if (!resp.ok) {
-            const body = await resp.text().catch(() => '');
-            throw new Error(`/incidents returned ${resp.status} ${body}`);
+            throw new Error(`Request failed (${resp.status} ${resp.statusText}) for ${url}`);
         }
-        const json = await resp.json();
-        const incidents = Array.isArray(json) ? json : (json.incidents || []);
-        // Minimal normalization — preserve existing logic elsewhere
-        crimes.value = incidents.map(i => ({
-            id: i.id ?? i.case_number ?? null,
-            case_number: i.case_number ?? i.case ?? '',
-            date: i.date ?? '',
-            time: i.time ?? '',
-            incident_type: i.incident_type ?? i.incident ?? '',
-            neighborhood_number: String(i.neighborhood_number ?? i.neighborhood_id ?? ''),
-            neighborhood_name: i.neighborhood_name ?? '',
-            block: i.block ?? i.address ?? '',
-            latitude: i.latitude ?? i.lat ?? null,
-            longitude: i.longitude ?? i.lng ?? null,
-            raw: i
-        }));
-        console.info(`initializeCrimes: loaded ${crimes.value.length} incidents`);
-        // Update counts/markers if you have those helpers
-        try { updateNeighborhoodMarkerPopups(); drawNeighborhoodMarkers(); } catch (e) { /* non-fatal */ }
-    } catch (err) {
-        console.error('initializeCrimes error:', err);
-        // Show a clear message but avoid crashing
-        alert('Failed to load incidents: ' + (err.message || String(err)));
+        return await resp.json();
     }
+
+    function getViewportBBox() {
+        // NW + SE corners of the visible map 
+        const b = map.leaflet.getBounds();
+        const nw = b.getNorthWest();
+        const se = b.getSouthEast();
+        return {
+            lat_min: se.lat,
+            lat_max: nw.lat,
+            lng_min: nw.lng,
+            lng_max: se.lng,
+        };
+    }
+
+    function normalizeIncident(raw) {
+        // Try to tolerate small schema differences.
+        const code = raw.code ?? raw.crime_code ?? raw.incident_code ?? raw.cfs_code;
+        const neighborhood_number = Number(raw.neighborhood_number ?? raw.neighborhood ?? raw.neighborhood_id ?? raw.neighborhoodNumber);
+        const incident_type =
+            codes_by_id.value.get(String(code)) ??
+            raw.incident_type ??
+            raw.incident ??
+            raw.description ??
+            '';
+
+        const neighborhood_name =
+            neighborhoods_by_id.value.get(neighborhood_number) ??
+            String(neighborhood_number ?? '');
+
+        const latitude = raw.latitude ?? raw.lat ?? raw.y;
+        const longitude = raw.longitude ?? raw.lng ?? raw.lon ?? raw.x;
+
+        const date = raw.date ?? (raw.datetime ? String(raw.datetime).slice(0, 10) : '');
+        const time = raw.time ?? (raw.datetime ? String(raw.datetime).slice(11, 16) : '');
+
+        return {
+            ...raw,
+            code,
+            neighborhood_number,
+            neighborhood_name,
+            incident_type,
+            latitude: latitude != null ? Number(latitude) : null,
+            longitude: longitude != null ? Number(longitude) : null,
+            date,
+            time,
+            case_number: raw.case_number ?? raw.case ?? raw.id ?? raw.caseNumber ?? '',
+        };
+    }
+
+    function compareMostRecentFirst(a, b) {
+        // Sort by date then time, descending.
+        const ad = a.date ?? '';
+        const bd = b.date ?? '';
+        if (ad !== bd) return bd.localeCompare(ad);
+        const at = a.time ?? '';
+        const bt = b.time ?? '';
+        return bt.localeCompare(at);
+    }
+
+    function updateNeighborhoodMarkers(filteredCrimes) {
+        // Count crimes per neighborhood_number within current viewport
+        const counts = new Map();
+        for (const c of filteredCrimes) {
+            const n = c.neighborhood_number;
+            if (!Number.isFinite(n)) continue;
+            counts.set(n, (counts.get(n) ?? 0) + 1);
+        }
+
+        // Create or update a marker per neighborhood.
+        map.neighborhood_markers.forEach((m, idx) => {
+            const neighborhood_number = idx + 1; // assumes 1..17 in order
+            const name =
+                neighborhoods_by_id.value.get(neighborhood_number) ??
+                `Neighborhood ${neighborhood_number}`;
+            const count = counts.get(neighborhood_number) ?? 0;
+
+            if (!m.marker) {
+                m.marker = L.marker(m.location).addTo(map.leaflet);
+            }
+            m.marker.bindPopup(`<b>${name}</b><br/>Crimes in view: ${count}`);
+        });
+    }
+
+    async function refreshCrimesForCurrentView() {
+        crimes_loading.value = true;
+        crimes_error.value = '';
+        try {
+            const bbox = getViewportBBox();
+
+            // Ask API for most recent incidents; if bbox params aren't supported,
+            // we still filter client-side using Leaflet bounds.contains().
+            const params = new URLSearchParams({
+                limit: String(crimes_limit.value ?? 1000),
+                lat_min: String(bbox.lat_min),
+                lat_max: String(bbox.lat_max),
+                lng_min: String(bbox.lng_min),
+                lng_max: String(bbox.lng_max),
+            });
+
+            const incidentsPayload = await fetchJson(api(`/incidents?${params.toString()}`));
+            const incidentsArr = Array.isArray(incidentsPayload)
+                ? incidentsPayload
+                : (incidentsPayload.incidents ?? incidentsPayload.data ?? []);
+
+            const normalized = incidentsArr
+                .map(normalizeIncident)
+                .sort(compareMostRecentFirst)
+                .slice(0, crimes_limit.value ?? 1000);
+
+            const bounds = map.leaflet.getBounds();
+            const inView = normalized.filter((c) => {
+                if (!Number.isFinite(c.latitude) || !Number.isFinite(c.longitude)) return false;
+                return bounds.contains([c.latitude, c.longitude]);
+            });
+
+            crimes.value = inView;
+            updateNeighborhoodMarkers(inView);
+        } catch (e) {
+            console.error(e);
+            crimes_error.value = e?.message ?? String(e);
+            crimes.value = [];
+            updateNeighborhoodMarkers([]);
+        } finally {
+            crimes_loading.value = false;
+        }
+    }
+
+    (async () => {
+        try {
+            // Load /codes and /neighborhoods first
+            const codesPayload = await fetchJson(api('/codes'));
+            const codesArr = Array.isArray(codesPayload) ? codesPayload : (codesPayload.codes ?? []);
+            const codeMap = new Map();
+            for (const row of codesArr) {
+                if (row?.code != null) codeMap.set(String(row.code), row.incident_type ?? row.incident ?? row.description ?? '');
+            }
+            codes_by_id.value = codeMap;
+
+            const nPayload = await fetchJson(api('/neighborhoods'));
+            const nArr = Array.isArray(nPayload) ? nPayload : (nPayload.neighborhoods ?? []);
+            const nMap = new Map();
+            for (const row of nArr) {
+                const num = row?.neighborhood_number ?? row?.id ?? row?.neighborhood ?? row?.number;
+                const name = row?.neighborhood_name ?? row?.name;
+                if (num != null) nMap.set(Number(num), name ?? String(num));
+            }
+            neighborhoods_by_id.value = nMap;
+
+            // Initial crimes fetch
+            await refreshCrimesForCurrentView();
+
+            // Refresh if user pans/zooms the map (keeps "visible neighborhoods" constraint true)
+            if (!crimes_map_listeners_added.value) {
+                crimes_map_listeners_added.value = true;
+                map.leaflet.on('moveend', () => {
+                    if (user_has_interacted.value) refreshCrimesForCurrentView();
+                });
+            }
+        } catch (e) {
+            console.error(e);
+            crimes_error.value = e?.message ?? String(e);
+        }
+    })();
 }
 
 // Function called when user presses 'OK' on dialog box
@@ -339,7 +452,7 @@ async function goToLocation() {
         }
         
         // Update map center and zoom in to show the location better
-        // Use zoom level 15 for a closer view of the location
+
         const zoomLevel = 15;
         map.leaflet.setView([lat, lng], zoomLevel);
         map.center.lat = lat;
@@ -362,7 +475,7 @@ async function goToLocation() {
     }
 }
 
-// Update location input from current map center (only called after user manually pans/zooms)
+// Update location input from current map center 
 async function updateLocationInputFromMap() {
     if (!map.leaflet) return;
     
@@ -554,6 +667,40 @@ function useMapLocationForForm() {
                 </div>
             </div>
         </div>
+
+<div class="grid-x grid-padding-x">
+    <div class="cell small-12">
+        <div class="crime-table-container">
+            <h2 class="crime-table-header">Recent Crimes (in current map view)</h2>
+            <div v-if="crimes_loading" class="crime-table-status">Loading crimes…</div>
+            <div v-else-if="crimes_error" class="crime-table-status error">{{ crimes_error }}</div>
+            <div v-else class="crime-table-status">Showing {{ crimes.length }} incidents (max {{ crimes_limit }})</div>
+
+            <table class="crime-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Time</th>
+                        <th>Incident Type</th>
+                        <th>Neighborhood</th>
+                        <th>Address / Block</th>
+                        <th>Case #</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr v-for="c in crimes" :key="c.case_number || (c.date + '-' + c.time + '-' + (c.block ?? c.address ?? ''))">
+                        <td>{{ c.date }}</td>
+                        <td>{{ c.time }}</td>
+                        <td>{{ c.incident_type }}</td>
+                        <td>{{ c.neighborhood_name }}</td>
+                        <td>{{ c.block ?? c.address ?? '' }}</td>
+                        <td>{{ c.case_number }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
         <div class="grid-x grid-padding-x">
             <div class="cell small-12">
                 <div class="incident-form-container">
@@ -838,4 +985,46 @@ function useMapLocationForForm() {
     opacity: 0.6;
     cursor: not-allowed;
 }
+
+.crime-table-container{
+    padding: 1.5rem;
+    background-color: #fff;
+    border-top: 1px solid #ddd;
+    margin-top: 1rem;
+}
+
+.crime-table-header{
+    font-size: 1.5rem;
+    font-weight: bold;
+    margin-bottom: 0.75rem;
+    color: #0a0a0a;
+}
+
+.crime-table-status{
+    margin-bottom: 0.75rem;
+    font-size: 0.95rem;
+}
+
+.crime-table-status.error{
+    color: #D32323;
+}
+
+.crime-table{
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.crime-table th,
+.crime-table td{
+    padding: 0.5rem;
+    border: 1px solid #e1e1e1;
+    font-size: 0.95rem;
+    vertical-align: top;
+}
+
+.crime-table thead th{
+    background: #f3f3f3;
+}
+
+
 </style>

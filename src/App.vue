@@ -120,16 +120,26 @@ function initializeCrimes() {
     // and display ONLY the ones within the current map viewport.
     if (!map.leaflet) return;
 
-    // Allow blank URL (same-origin) and tolerate inputs like "localhost:8000"
-    // or "http://localhost:8000/".
     let baseInput = (crime_url.value ?? '').trim();
-    if (baseInput === '') {
-        baseInput = ''; // same-origin
-    } else if (!/^https?:\/\//i.test(baseInput)) {
-        // If user typed "localhost:8000" or "127.0.0.1:8000", prepend scheme.
-        baseInput = `http://${baseInput}`;
+
+    function normalizeApiBase(raw) {
+        let base = (raw ?? '').trim();
+        if (!base) return ''; // same-origin
+
+        if (!/^https?:\/\//i.test(base)) {
+            base = `http://${base}`;
+        }
+
+        // remove trailing slash
+        base = base.replace(/\/+$/, '');
+
+        // strip endpoint if user pasted one
+        base = base.replace(/\/(codes|neighborhoods|incidents)(\/.*)?$/i, '');
+
+        return base;
     }
-    const base = baseInput.replace(/\/$/, '');
+
+    const base = normalizeApiBase(baseInput);
     const api = (p) => (base ? `${base}${p}` : p);
 
     async function fetchJson(url) {

@@ -115,6 +115,23 @@ onMounted(() => {
 });
 
 
+
+// ---- FETCH HELPERS (avoid `response.json()` crashing on empty/invalid JSON) ----
+async function fetchJsonSafe(url, options) {
+    const resp = await fetch(url, options);
+    const raw = await resp.text().catch(() => '');
+    if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} ${resp.statusText} ${raw}`.trim());
+    }
+    if (!raw) return { resp, data: null, raw: '' };
+    try {
+        return { resp, data: JSON.parse(raw), raw };
+    } catch (e) {
+        console.error('Invalid JSON from', url, raw);
+        throw e;
+    }
+}
+
 // FUNCTIONS
 // Function called once user has entered REST API URL
 async function initializeCrimes() {
@@ -128,13 +145,11 @@ async function initializeCrimes() {
 
     // 1) fetch lookups (best-effort)
     try {
-        const [codesResp, nbhResp] = await Promise.all([
-            fetch(`${base}/codes`),
-            fetch(`${base}/neighborhoods`)
+        const [{ data: codesArr }, { data: nbhArr }] = await Promise.all([
+            fetchJsonSafe(`${base}/codes`),
+            fetchJsonSafe(`${base}/neighborhoods`)
         ]);
 
-        const codesArr = codesResp.ok ? await codesResp.json() : [];
-        const nbhArr = nbhResp.ok ? await nbhResp.json() : [];
 
         const codeMap = {};
         if (Array.isArray(codesArr)) {
@@ -191,13 +206,8 @@ async function initializeCrimes() {
     console.info('initializeCrimes: requesting', url);
 
     try {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-            const txt = await resp.text().catch(() => '');
-            throw new Error(`/incidents returned ${resp.status} ${txt}`);
-        }
-        const json = await resp.json();
-        const incidents = Array.isArray(json) ? json : (json.incidents || []);
+        const { data: json } = await fetchJsonSafe(url);
+        const incidents = Array.isArray(json) ? json : ((json && json.incidents) ? json.incidents : []);
 
         // 4) normalize rows and only keep incidents in the visible bbox
         const rows = incidents.map(i => {
@@ -669,13 +679,8 @@ async function refreshCrimesWithFilters() {
     console.info('refreshCrimesWithFilters requesting', url);
 
     try {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-            const txt = await resp.text().catch(() => '');
-            throw new Error(`/incidents returned ${resp.status} ${txt}`);
-        }
-        const json = await resp.json();
-        const incidents = Array.isArray(json) ? json : (json.incidents || []);
+        const { data: json } = await fetchJsonSafe(url);
+        const incidents = Array.isArray(json) ? json : ((json && json.incidents) ? json.incidents : []);
 
         const rows = incidents.map(i => {
             const codeKey = String(i.code ?? i.crime_code ?? '');

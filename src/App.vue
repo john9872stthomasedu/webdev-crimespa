@@ -168,6 +168,9 @@ async function initializeCrimes() {
             });
         }
         neighborhoods_by_id.value = nbhMap;
+        
+        // Populate filter lists after loading lookups
+        populateFilterLists();
     } catch (err) {
         console.warn('initializeCrimes: lookup fetch failed (continuing):', err);
         // keep empty maps if lookups failed
@@ -661,11 +664,25 @@ async function refreshCrimesWithFilters() {
 
     // map selected incident type names back to codes (if lookups exist)
     const activeTypes = new Set(Object.entries(filters.incident_types).filter(([k,v]) => v).map(([k]) => k));
-    const selectedCodes = [];
-    Object.entries(codes_by_code.value || {}).forEach(([code, type]) => {
-        if (activeTypes.size === 0 || activeTypes.has(type)) selectedCodes.push(code);
-    });
-    if (selectedCodes.length) params.append('code', selectedCodes.join(','));
+    const allTypes = new Set(Object.keys(filters.incident_types || {}));
+    
+    // Only filter by codes if some (but not all) types are selected
+    // If all types are selected, don't send code filter (let backend return all)
+    const selectedCodesSet = new Set();
+    if (activeTypes.size > 0 && activeTypes.size < allTypes.size) {
+        // Some types are unchecked, so filter by selected types
+        Object.entries(codes_by_code.value || {}).forEach(([code, type]) => {
+            if (activeTypes.has(type) && code != null && code !== '') {
+                // Ensure code is a clean string and add to set to avoid duplicates
+                selectedCodesSet.add(String(code).trim());
+            }
+        });
+    }
+    // If we have selected codes, add to params as comma-separated string
+    if (selectedCodesSet.size > 0) {
+        const selectedCodesArray = Array.from(selectedCodesSet).sort();
+        params.append('code', selectedCodesArray.join(','));
+    }
 
     // map selected neighborhood names to ids
     const nameToId = {};
@@ -738,6 +755,45 @@ function resetFilters() {
     filters.start_date = '';
     filters.end_date = '';
     filters.max_incidents = 1000;
+}
+
+// Draw markers for neighborhoods (only for neighborhoods that have crimes or are in the lookup)
+function drawNeighborhoodMarkers() {
+    if (!map.leaflet || !Array.isArray(map.neighborhood_markers)) return;
+    
+    // Get all neighborhood IDs that either have crimes or exist in the lookup
+    const relevantNeighborhoodIds = new Set();
+    Object.keys(neighborhood_crime_counts.value).forEach(id => relevantNeighborhoodIds.add(id));
+    Object.keys(neighborhoods_by_id.value).forEach(id => relevantNeighborhoodIds.add(id));
+    
+    // Draw markers for neighborhoods
+    map.neighborhood_markers.forEach((m, idx) => {
+        const neighborhoodId = String(idx + 1); // Assume sequential IDs for hardcoded positions
+        
+        // Only create marker if this neighborhood has crimes or exists in lookup
+        if (relevantNeighborhoodIds.has(neighborhoodId)) {
+            if (!m.marker) {
+                m.marker = L.marker(m.location).addTo(map.leaflet);
+            }
+            m.neighborhoodId = neighborhoodId;
+        }
+    });
+}
+
+// Update popups on neighborhood markers with current crime counts
+function updateNeighborhoodMarkerPopups() {
+    if (!map.leaflet || !Array.isArray(map.neighborhood_markers)) return;
+    const counts = neighborhood_crime_counts.value || {};
+    
+    map.neighborhood_markers.forEach((m) => {
+        if (!m.marker || !m.neighborhoodId) return;
+        
+        const neighborhoodId = String(m.neighborhoodId);
+        const name = neighborhoods_by_id.value[neighborhoodId] || `Neighborhood ${neighborhoodId}`;
+        const cnt = counts[neighborhoodId] || 0;
+        const popupHtml = `<div><strong>${name}</strong><br/>Crimes in view: ${cnt}</div>`;
+        m.marker.bindPopup(popupHtml);
+    });
 }
 
 // add these reactive vars (near your other refs)
@@ -1116,6 +1172,25 @@ async function deleteIncident(crime) {
 
         <div class="grid-x grid-padding-x">
             <div class="cell small-12">
+                <!-- Crime Category Legend -->
+                <div style="padding:1rem; background:#fff; border:1px solid #ddd; margin-bottom:1rem; border-radius:4px;">
+                    <h4 style="margin:0 0 0.5rem 0;">Crime Category Legend</h4>
+                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#ffe9e6; border:1px solid #ccc;"></div>
+                            <span>Violent Crimes</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#e6f0ff; border:1px solid #ccc;"></div>
+                            <span>Property Crimes</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#f7f7f7; border:1px solid #ccc;"></div>
+                            <span>Other Crimes</span>
+                        </div>
+                    </div>
+                </div>
+                
                 <table class="crime-table" style="width:100%; border-collapse:collapse;">
                     <thead>
                         <tr style="background-color:#f2f2f2; font-weight:bold;">
@@ -1126,7 +1201,8 @@ async function deleteIncident(crime) {
                             <th style="padding:0.5rem; text-align:left;">Block</th>
                             <th style="padding:0.5rem; text-align:left;">Latitude</th>
                             <th style="padding:0.5rem; text-align:left;">Longitude</th>
-                            <th style="padding:0.5rem; text-align:left;">Actions</th>
+                            <th style="padding:0.5rem; text-align:left;">Select</th>
+                            <th style="padding:0.5rem; text-align:left;">Delete</th>
                         </tr>
                     </thead>
                     <tbody>

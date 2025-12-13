@@ -101,36 +101,37 @@ onMounted(() => {
 });
 async function debugFetchFirstIncident() {
     if (!crime_url.value) {
-        console.error('REST API URL not set');
-        alert('Please enter the REST API URL first.');
+        alert("Please enter the REST API URL first.");
         return;
     }
 
+    // IMPORTANT: decide what crime_url is:
+    // If crime_url is a BASE url like http://localhost:8000, this works:
+    const url = `${crime_url.value.replace(/\/$/, "")}/incidents`;
+
     try {
-        const response = await fetch(`${crime_url}/incidents`);
+        const response = await fetch(url);
+        const data = await readResponseBodySafely(response);
+
         if (!response.ok) {
-            throw new Error(`Server error ${response.status}`);
+            throw new Error(
+                (data && typeof data === "object" && (data.error || data.message)) ||
+                (typeof data === "string" ? data : "") ||
+                `Request failed: ${response.status}`
+            );
         }
 
-        const data = await response.json();
-
-        // Handle array OR { incidents: [...] }
-        const incidents = Array.isArray(data)
-            ? data
-            : data.incidents || [];
-
-        if (incidents.length === 0) {
-            console.log('Database is empty');
-            alert('Database returned no incidents.');
+        const incidents = Array.isArray(data) ? data : (data.incidents || data.data || []);
+        if (!incidents.length) {
+            alert("No incidents returned (see console for raw response).");
             return;
         }
 
-        console.log('FIRST DATABASE ENTRY:', incidents[0]);
+        console.log("FIRST DATABASE ENTRY:", incidents[0]);
         alert(`First entry (see console):\n${JSON.stringify(incidents[0], null, 2)}`);
-
     } catch (err) {
-        console.error('Debug fetch failed:', err);
-        alert(`Debug error: ${err.message}`);
+        console.error("Debug fetch failed:", err);
+        alert(`Debug error: ${err.message}\n(See console for raw response)`);
     }
 }
 

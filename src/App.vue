@@ -208,7 +208,7 @@ async function initializeCrimes() {
                 case_number: i.case_number ?? i.case ?? '',
                 date: i.date ?? (i.date_time ? i.date_time.split(' ')[0] : ''),
                 time: i.time ?? (i.date_time ? i.date_time.split(' ')[1] : ''),
-                incident_type: codes_by_code.value[String(codeKey)] || i.incident_type ?? i.incident ?? String(codeKey),
+                incident_type: codes_by_code.value[String(codeKey)] || (i.incident_type ?? i.incident ?? String(codeKey)),
                 neighborhood_number: nbhKey,
                 neighborhood_name: neighborhoods_by_id.value[nbhKey] || i.neighborhood_name || '',
                 block: i.block ?? i.address ?? '',

@@ -107,7 +107,7 @@ async function debugFetchFirstIncident() {
     }
 
     try {
-        const response = await fetch(`${crime_url.value}/incidents`);
+        const response = await fetch(`${crime_url}/incidents`);
         if (!response.ok) {
             throw new Error(`Server error ${response.status}`);
         }

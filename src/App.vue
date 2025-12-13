@@ -58,6 +58,20 @@ let map = reactive(
     }
 );
 
+let codes_by_code = ref({});
+let neighborhoods_by_id = ref({});
+let crimes = ref([]);
+let neighborhood_crime_counts = ref({});
+
+// --- FILTER STATE & HELPERS (add below your other reactive state like codes_by_code/neighborhoods_by_id) ---
+let filters = reactive({
+    incident_types: {},   // { "Theft": true, "Narcotics": true, ... }
+    neighborhoods: {},    // { "Downtown": true, ... }
+    start_date: '',       // 'YYYY-MM-DD'
+    end_date: '',
+    max_incidents: 1000
+});
+
 // Vue callback for once <template> HTML has been added to web page
 onMounted(() => {
     // Create Leaflet map (set bounds and valied zoom levels)
@@ -99,47 +113,155 @@ onMounted(() => {
         }
     });
 });
-async function debugFetchFirstIncident() {
-    if (!crime_url.value) {
-        alert("Please enter the REST API URL first.");
-        return;
-    }
 
-    // IMPORTANT: decide what crime_url is:
-    // If crime_url is a BASE url like http://localhost:8000, this works:
-    const url = `${crime_url.value.replace(/\/$/, "")}/incidents`;
-
-    try {
-        const response = await fetch(url);
-        const data = await readResponseBodySafely(response);
-
-        if (!response.ok) {
-            throw new Error(
-                (data && typeof data === "object" && (data.error || data.message)) ||
-                (typeof data === "string" ? data : "") ||
-                `Request failed: ${response.status}`
-            );
-        }
-
-        const incidents = Array.isArray(data) ? data : (data.incidents || data.data || []);
-        if (!incidents.length) {
-            alert("No incidents returned (see console for raw response).");
-            return;
-        }
-
-        console.log("FIRST DATABASE ENTRY:", incidents[0]);
-        alert(`First entry (see console):\n${JSON.stringify(incidents[0], null, 2)}`);
-    } catch (err) {
-        console.error("Debug fetch failed:", err);
-        alert(`Debug error: ${err.message}\n(See console for raw response)`);
-    }
-}
 
 // FUNCTIONS
 // Function called once user has entered REST API URL
-function initializeCrimes() {
-    // TODO: get code and neighborhood data
-    //       get initial 1000 crimes
+async function initializeCrimes() {
+    if (!crime_url || !crime_url.value) {
+        console.warn('initializeCrimes: crime_url not set');
+        return;
+    }
+
+    const base = String(crime_url.value).replace(/\/$/, '');
+    console.info('initializeCrimes: using base URL', base);
+
+    // 1) fetch lookups (best-effort)
+    try {
+        const [codesResp, nbhResp] = await Promise.all([
+            fetch(`${base}/codes`),
+            fetch(`${base}/neighborhoods`)
+        ]);
+
+        const codesArr = codesResp.ok ? await codesResp.json() : [];
+        const nbhArr = nbhResp.ok ? await nbhResp.json() : [];
+
+        const codeMap = {};
+        if (Array.isArray(codesArr)) {
+            codesArr.forEach(c => {
+                if (c && c.code != null) codeMap[String(c.code)] = c.incident_type ?? c.incident ?? c.description ?? '';
+            });
+        }
+        codes_by_code.value = codeMap;
+
+        const nbhMap = {};
+        if (Array.isArray(nbhArr)) {
+            nbhArr.forEach(n => {
+                const id = n.neighborhood_number ?? n.id ?? n.neighborhood_id;
+                const name = n.neighborhood_name ?? n.name ?? '';
+                if (id != null) nbhMap[String(id)] = name;
+            });
+        }
+        neighborhoods_by_id.value = nbhMap;
+    } catch (err) {
+        console.warn('initializeCrimes: lookup fetch failed (continuing):', err);
+        // keep empty maps if lookups failed
+        codes_by_code.value = codes_by_code.value || {};
+        neighborhoods_by_id.value = neighborhoods_by_id.value || {};
+    }
+
+    // 2) compute bbox (use leaflet if available, otherwise map.bounds)
+    let south = 44.883658, north = 45.008206, west = -93.217977, east = -92.993787;
+    try {
+        if (map.leaflet && typeof map.leaflet.getBounds === 'function') {
+            const b = map.leaflet.getBounds();
+            south = b.getSouth();
+            north = b.getNorth();
+            west = b.getWest();
+            east = b.getEast();
+        } else if (map.bounds) {
+            south = map.bounds.se?.lat ?? south;
+            north = map.bounds.nw?.lat ?? north;
+            west = map.bounds.nw?.lng ?? west;
+            east = map.bounds.se?.lng ?? east;
+        }
+    } catch (e) {
+        console.warn('initializeCrimes: bbox calculation failed, using defaults', e);
+    }
+
+    // 3) request incidents limited to 1000 and bbox
+    const params = new URLSearchParams({
+        limit: '1000',
+        lat_min: String(south),
+        lat_max: String(north),
+        lng_min: String(west),
+        lng_max: String(east)
+    });
+    const url = `${base}/incidents?${params.toString()}`;
+    console.info('initializeCrimes: requesting', url);
+
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+            const txt = await resp.text().catch(() => '');
+            throw new Error(`/incidents returned ${resp.status} ${txt}`);
+        }
+        const json = await resp.json();
+        const incidents = Array.isArray(json) ? json : (json.incidents || []);
+
+        // 4) normalize rows and only keep incidents in the visible bbox
+        const rows = incidents.map(i => {
+            const codeKey = String(i.code ?? i.crime_code ?? '');
+            const nbhKey = String(i.neighborhood_number ?? i.neighborhood ?? i.neighborhood_id ?? '');
+            return {
+                id: i.id ?? i.case_number ?? i.case ?? null,
+                case_number: i.case_number ?? i.case ?? '',
+                date: i.date ?? (i.date_time ? i.date_time.split(' ')[0] : ''),
+                time: i.time ?? (i.date_time ? i.date_time.split(' ')[1] : ''),
+                incident_type: codes_by_code.value[String(codeKey)] || i.incident_type ?? i.incident ?? String(codeKey),
+                neighborhood_number: nbhKey,
+                neighborhood_name: neighborhoods_by_id.value[nbhKey] || i.neighborhood_name || '',
+                block: i.block ?? i.address ?? '',
+                latitude: (i.latitude ?? i.lat) != null ? parseFloat(i.latitude ?? i.lat) : null,
+                longitude: (i.longitude ?? i.lng) != null ? parseFloat(i.longitude ?? i.lng) : null,
+                raw: i
+            };
+        }).filter(r => {
+            // Only show crimes that occurred within the current visible bbox (defensive)
+            if (r.latitude == null || r.longitude == null) return false;
+            if (isNaN(r.latitude) || isNaN(r.longitude)) return false;
+            return r.latitude >= south && r.latitude <= north && r.longitude >= west && r.longitude <= east;
+        });
+
+        // 5) order with most recent on top
+        rows.sort((a, b) => {
+            const at = Date.parse(`${a.date}T${a.time || '00:00:00'}`);
+            const bt = Date.parse(`${b.date}T${b.time || '00:00:00'}`);
+            if (Number.isNaN(at) || Number.isNaN(bt)) return 0;
+            return bt - at;
+        });
+
+        crimes.value = rows;
+
+        // 6) compute per-neighborhood counts (keyed by neighborhood_number)
+        const counts = {};
+        rows.forEach(r => {
+            const id = String(r.neighborhood_number ?? '');
+            if (!id) return;
+            counts[id] = (counts[id] || 0) + 1;
+        });
+        neighborhood_crime_counts.value = counts;
+
+        // 7) draw one marker per neighborhood center and set popup with counts
+        if (map.leaflet && Array.isArray(map.neighborhood_markers)) {
+            map.neighborhood_markers.forEach((m, idx) => {
+                const neighborhoodId = String(idx + 1);
+                if (!m.marker) {
+                    m.marker = L.marker(m.location).addTo(map.leaflet);
+                }
+                m.neighborhoodId = neighborhoodId;
+                const name = neighborhoods_by_id.value[neighborhoodId] || `Neighborhood ${neighborhoodId}`;
+                const cnt = counts[neighborhoodId] || 0;
+                const popupHtml = `<div><strong>${name}</strong><br/>Crimes in view: ${cnt}</div>`;
+                m.marker.bindPopup(popupHtml);
+            });
+        }
+
+        console.info(`initializeCrimes: loaded ${rows.length} incidents`);
+    } catch (err) {
+        console.error('initializeCrimes error:', err);
+        alert('Failed to load incidents: ' + (err.message || String(err)));
+    }
 }
 
 // Function called when user presses 'OK' on dialog box
@@ -484,6 +606,295 @@ function useMapLocationForForm() {
         }
     }
 }
+
+// Populate checkboxes from lookups (call this after you set codes_by_code.value and neighborhoods_by_id.value)
+function populateFilterLists() {
+    // incident types from codes_by_code
+    const types = new Set(Object.values(codes_by_code.value || {}).filter(Boolean));
+    types.forEach(t => { if (!(t in filters.incident_types)) filters.incident_types[t] = true; });
+
+    // neighborhoods from neighborhoods_by_id
+    Object.values(neighborhoods_by_id.value || {}).forEach(n => {
+        if (n && !(n in filters.neighborhoods)) filters.neighborhoods[n] = true;
+    });
+}
+
+// Build request using bbox + filters, fetch incidents, normalize, sort, update crimes and neighborhood counts
+async function refreshCrimesWithFilters() {
+    if (!crime_url || !crime_url.value) return;
+    const base = String(crime_url.value).replace(/\/$/, '');
+
+    // compute bbox (leaflet preferred)
+    let south = 44.883658, north = 45.008206, west = -93.217977, east = -92.993787;
+    try {
+        if (map && map.leaflet && typeof map.leaflet.getBounds === 'function') {
+            const b = map.leaflet.getBounds();
+            south = b.getSouth(); north = b.getNorth(); west = b.getWest(); east = b.getEast();
+        } else if (map && map.bounds) {
+            south = map.bounds.se?.lat ?? south;
+            north = map.bounds.nw?.lat ?? north;
+            west = map.bounds.nw?.lng ?? west;
+            east = map.bounds.se?.lng ?? east;
+        }
+    } catch (e) {
+        console.warn('refreshCrimesWithFilters: bbox failed, using defaults', e);
+    }
+
+    const params = new URLSearchParams();
+    params.append('limit', String(filters.max_incidents || 1000));
+    params.append('lat_min', String(south));
+    params.append('lat_max', String(north));
+    params.append('lng_min', String(west));
+    params.append('lng_max', String(east));
+    if (filters.start_date) params.append('start_date', filters.start_date);
+    if (filters.end_date) params.append('end_date', filters.end_date);
+
+    // map selected incident type names back to codes (if lookups exist)
+    const activeTypes = new Set(Object.entries(filters.incident_types).filter(([k,v]) => v).map(([k]) => k));
+    const selectedCodes = [];
+    Object.entries(codes_by_code.value || {}).forEach(([code, type]) => {
+        if (activeTypes.size === 0 || activeTypes.has(type)) selectedCodes.push(code);
+    });
+    if (selectedCodes.length) params.append('code', selectedCodes.join(','));
+
+    // map selected neighborhood names to ids
+    const nameToId = {};
+    Object.entries(neighborhoods_by_id.value || {}).forEach(([id, name]) => { nameToId[name] = id; });
+    const selectedNeighborhoodIds = Object.entries(filters.neighborhoods)
+        .filter(([name, checked]) => checked && nameToId[name])
+        .map(([name]) => nameToId[name]);
+    if (selectedNeighborhoodIds.length) params.append('neighborhood', selectedNeighborhoodIds.join(','));
+
+    const url = `${base}/incidents?${params.toString()}`;
+    console.info('refreshCrimesWithFilters requesting', url);
+
+    try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+            const txt = await resp.text().catch(() => '');
+            throw new Error(`/incidents returned ${resp.status} ${txt}`);
+        }
+        const json = await resp.json();
+        const incidents = Array.isArray(json) ? json : (json.incidents || []);
+
+        const rows = incidents.map(i => {
+            const codeKey = String(i.code ?? i.crime_code ?? '');
+            const nbhKey = String(i.neighborhood_number ?? i.neighborhood ?? i.neighborhood_id ?? '');
+            return {
+                id: i.id ?? i.case_number ?? i.case ?? null,
+                case_number: i.case_number ?? i.case ?? '',
+                date: i.date ?? (i.date_time ? i.date_time.split(' ')[0] : ''),
+                time: i.time ?? (i.date_time ? i.date_time.split(' ')[1] : ''),
+                incident_type: (codes_by_code.value && codes_by_code.value[String(codeKey)]) || i.incident_type || i.incident || String(codeKey),
+                neighborhood_number: nbhKey,
+                neighborhood_name: (neighborhoods_by_id.value && neighborhoods_by_id.value[nbhKey]) || i.neighborhood_name || '',
+                block: i.block ?? i.address ?? '',
+                latitude: (i.latitude ?? i.lat) != null ? parseFloat(i.latitude ?? i.lat) : null,
+                longitude: (i.longitude ?? i.lng) != null ? parseFloat(i.longitude ?? i.lng) : null,
+                raw: i
+            };
+        }).filter(r => {
+            if (r.latitude == null || r.longitude == null) return false;
+            if (isNaN(r.latitude) || isNaN(r.longitude)) return false;
+            return r.latitude >= south && r.latitude <= north && r.longitude >= west && r.longitude <= east;
+        });
+
+        rows.sort((a, b) => {
+            const at = Date.parse(`${a.date}T${a.time || '00:00:00'}`);
+            const bt = Date.parse(`${b.date}T${b.time || '00:00:00'}`);
+            if (Number.isNaN(at) || Number.isNaN(bt)) return 0;
+            return bt - at;
+        });
+
+        crimes.value = rows;
+
+        // compute neighborhood counts
+        const counts = {};
+        rows.forEach(r => {
+            const id = String(r.neighborhood_number ?? '');
+            if (!id) return;
+            counts[id] = (counts[id] || 0) + 1;
+        });
+        neighborhood_crime_counts.value = counts;
+
+        // update neighborhood markers/popups
+        try { drawNeighborhoodMarkers(); updateNeighborhoodMarkerPopups(); } catch (e) { /* non-fatal */ }
+
+        console.info(`refreshCrimesWithFilters: loaded ${rows.length} incidents`);
+    } catch (err) {
+        console.error('refreshCrimesWithFilters error:', err);
+        alert('Failed to refresh incidents: ' + (err.message || String(err)));
+    }
+}
+
+function resetFilters() {
+    Object.keys(filters.incident_types).forEach(k => filters.incident_types[k] = true);
+    Object.keys(filters.neighborhoods).forEach(k => filters.neighborhoods[k] = true);
+    filters.start_date = '';
+    filters.end_date = '';
+    filters.max_incidents = 1000;
+}
+
+// add these reactive vars (near your other refs)
+let selected_crime_marker = ref(null);
+let selected_crime_id = ref(null);
+
+// sanitize obfuscated address numbers (replace X in the leading house number with '0')
+function sanitizeAddressNumber(addr) {
+    if (!addr || typeof addr !== 'string') return addr;
+    // Replace single 'X' immediately after leading digits: "98X UNIVERSITY AV W" -> "980 UNIVERSITY AV W"
+    return addr.replace(/^(\d+)X(?=\b| )/, '$10');
+}
+
+// categorize crimes (simple keyword-based)
+function categorizeCrime(crime) {
+    const text = String(crime.incident_type || crime.raw?.incident_type || crime.raw?.incident || '').toLowerCase();
+    const violent = ['assault','battery','robbery','homicide','murder','rape','sexual','aggravated','threat'];
+    const property = ['theft','burglary','larceny','vandalism','shoplifting','arson','vehicle','motor vehicle','auto','stolen'];
+    for (const k of violent) if (text.includes(k)) return 'violent';
+    for (const k of property) if (text.includes(k)) return 'property';
+    return 'other';
+}
+
+function crimeRowClass(crime) {
+    return 'crime-row ' + categorizeCrime(crime);
+}
+
+// show a distinct marker for a selected crime and attach popup with delete button
+async function selectCrime(crime) {
+    if (!map.leaflet) return;
+    // remove previous selected marker
+    if (selected_crime_marker.value) {
+        selected_crime_marker.value.remove();
+        selected_crime_marker.value = null;
+        selected_crime_id.value = null;
+    }
+
+    let lat = parseFloat(crime.latitude ?? crime.lat ?? NaN);
+    let lng = parseFloat(crime.longitude ?? crime.lng ?? NaN);
+
+    if (!isFinite(lat) || !isFinite(lng)) {
+        // try geocoding sanitized address
+        const addr = sanitizeAddressNumber(crime.block || crime.address || crime.neighborhood_name || '');
+        if (addr) {
+            try {
+                const geo = await geocodeAddress(addr);
+                if (geo && geo.lat && geo.lon) {
+                    lat = parseFloat(geo.lat);
+                    lng = parseFloat(geo.lon);
+                }
+            } catch (e) {
+                console.warn('Geocode failed', e);
+            }
+        }
+    }
+
+    if (!isFinite(lat) || !isFinite(lng)) {
+        alert('No valid location available for this incident.');
+        return;
+    }
+
+    // distinct style: red circle marker
+    const marker = L.circleMarker([lat, lng], {
+        color: '#b30000',
+        fillColor: '#ff6666',
+        fillOpacity: 0.9,
+        radius: 7,
+        weight: 2
+    }).addTo(map.leaflet);
+
+    const popupId = `delete-btn-${encodeURIComponent(String(crime.id ?? crime.case_number ?? Math.random()))}`;
+    const popupHtml = `
+        <div>
+            <div><strong>${crime.date || ''} ${crime.time || ''}</strong></div>
+            <div>${crime.incident_type || ''}</div>
+            <div style="margin-top:.5rem;">
+                <button id="${popupId}" style="background:#c82333;color:#fff;border:0;padding:.35rem .6rem;border-radius:4px;cursor:pointer;">Delete</button>
+            </div>
+        </div>
+    `;
+    marker.bindPopup(popupHtml);
+
+    marker.on('popupopen', () => {
+        const btn = document.getElementById(popupId);
+        if (!btn) return;
+        const handler = async (ev) => {
+            ev.preventDefault();
+            btn.disabled = true;
+            try {
+                await deleteIncident(crime);
+            } catch (err) {
+                console.error('Delete failed:', err);
+                alert('Delete failed: ' + (err.message || err));
+                btn.disabled = false;
+            } finally {
+                btn.removeEventListener('click', handler);
+            }
+        };
+        btn.addEventListener('click', handler);
+    });
+
+    selected_crime_marker.value = marker;
+    selected_crime_id.value = crime.id ?? crime.case_number ?? null;
+
+    try { map.leaflet.setView([lat, lng], Math.max(map.leaflet.getZoom(), 15)); } catch {}
+}
+
+// delete incident via REST API and update UI
+async function deleteIncident(crime) {
+    if (!crime_url || !crime_url.value) throw new Error('API base URL not set');
+    const id = crime.id ?? crime.case_number ?? crime.case ?? null;
+    if (!id) throw new Error('No identifier for incident');
+
+    const base = String(crime_url.value).replace(/\/$/, '');
+    // try DELETE /incidents/:id first, fall back to /remove-incident
+    const tryUrl = `${base}/incidents/${encodeURIComponent(String(id))}`;
+    if (!confirm('Delete this incident from the database? This cannot be undone.')) return;
+
+    let resp;
+    try {
+        resp = await fetch(tryUrl, { method: 'DELETE' });
+        if (!resp.ok) {
+            // fallback: call /remove-incident with JSON body
+            const fallbackUrl = `${base}/remove-incident`;
+            resp = await fetch(fallbackUrl, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: id, case_number: id })
+            });
+        }
+    } catch (e) {
+        throw new Error('Network error: ' + e.message);
+    }
+
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`Delete failed (${resp.status}) ${text}`);
+    }
+
+    // remove from local list and update counts/popups
+    crimes.value = crimes.value.filter(c => String(c.id ?? c.case_number ?? c.case ?? '') !== String(id));
+
+    const counts = {};
+    crimes.value.forEach(r => {
+        const nid = String(r.neighborhood_number ?? '');
+        if (!nid) return;
+        counts[nid] = (counts[nid] || 0) + 1;
+    });
+    neighborhood_crime_counts.value = counts;
+
+    // remove selected marker if it was for this crime
+    if (selected_crime_id.value && String(selected_crime_id.value) === String(id)) {
+        if (selected_crime_marker.value) {
+            selected_crime_marker.value.remove();
+            selected_crime_marker.value = null;
+            selected_crime_id.value = null;
+        }
+    }
+
+    // refresh neighborhood popups
+    try { updateNeighborhoodMarkerPopups(); } catch (e) {}
+}
 </script>
 
 <template>
@@ -514,6 +925,51 @@ function useMapLocationForForm() {
                 </div>
             </div>
         </div>
+
+        <!-- Insert this filter UI block into your <template> near the location-search or above the incidents table -->
+        <div class="grid-x grid-padding-x filter-container" style="padding:1rem; background:#fafafa; border-top:1px solid #eee;">
+            <div class="cell small-12 medium-6">
+                <h4 style="margin:0 0 .5rem 0">Incident Types</h4>
+                <div style="max-height:200px; overflow:auto; border:1px solid #eee; padding:.5rem;">
+                    <div v-for="(checked, type) in filters.incident_types" :key="type" style="margin-bottom:.25rem;">
+                        <label style="cursor:pointer;">
+                            <input type="checkbox" v-model="filters.incident_types[type]" /> {{ type }}
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="cell small-12 medium-6">
+                <h4 style="margin:0 0 .5rem 0">Neighborhoods</h4>
+                <div style="max-height:200px; overflow:auto; border:1px solid #eee; padding:.5rem;">
+                    <div v-for="(checked, name) in filters.neighborhoods" :key="name" style="margin-bottom:.25rem;">
+                        <label style="cursor:pointer;">
+                            <input type="checkbox" v-model="filters.neighborhoods[name]" /> {{ name }}
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="cell small-12 medium-4" style="margin-top:.5rem;">
+                <label>Start date</label>
+                <input type="date" v-model="filters.start_date" />
+            </div>
+            <div class="cell small-12 medium-4" style="margin-top:.5rem;">
+                <label>End date</label>
+                <input type="date" v-model="filters.end_date" />
+            </div>
+            <div class="cell small-12 medium-4" style="margin-top:.5rem;">
+                <label>Max incidents</label>
+                <input type="number" min="1" step="1" v-model.number="filters.max_incidents" />
+            </div>
+
+            <div class="cell small-12" style="margin-top:.5rem;">
+                <button class="button" type="button" @click="refreshCrimesWithFilters()">Update</button>
+                <button class="button secondary" type="button" @click="resetFilters()">Reset</button>
+            </div>
+        </div>
+        <!-- end filter UI -->
+
         <div class="grid-x grid-padding-x">
             <div class="cell small-12">
                 <div class="incident-form-container">
@@ -647,16 +1103,46 @@ function useMapLocationForForm() {
                                     Clear Form
                                 </button>
                             </div>
-                            <button
-                                type="button"
-                                class="button secondary small"
-                                @click="debugFetchFirstIncident"
-                            >
-                                Debug: Fetch First DB Entry
-                            </button>
                         </div>
                     </form>
                 </div>
+            </div>
+        </div>
+
+        <div class="grid-x grid-padding-x">
+            <div class="cell small-12">
+                <table class="crime-table" style="width:100%; border-collapse:collapse;">
+                    <thead>
+                        <tr style="background-color:#f2f2f2; font-weight:bold;">
+                            <th style="padding:0.5rem; text-align:left;">Date</th>
+                            <th style="padding:0.5rem; text-align:left;">Time</th>
+                            <th style="padding:0.5rem; text-align:left;">Incident Type</th>
+                            <th style="padding:0.5rem; text-align:left;">Neighborhood</th>
+                            <th style="padding:0.5rem; text-align:left;">Block</th>
+                            <th style="padding:0.5rem; text-align:left;">Latitude</th>
+                            <th style="padding:0.5rem; text-align:left;">Longitude</th>
+                            <th style="padding:0.5rem; text-align:left;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- replace/augment your incidents table row rendering with this -->
+                        <tr v-for="crime in crimes" :key="crime.id ?? crime.case_number" :class="crimeRowClass(crime)">
+                            <td style="padding:0.5rem;">{{ crime.date }}</td>
+                            <td style="padding:0.5rem;">{{ crime.time }}</td>
+                            <td style="padding:0.5rem;">{{ crime.incident_type }}</td>
+                            <td style="padding:0.5rem;">{{ crime.neighborhood_name }}</td>
+                            <td style="padding:0.5rem;">{{ crime.block }}</td>
+                            <td style="padding:0.5rem;">{{ crime.latitude }}</td>
+                            <td style="padding:0.5rem;">{{ crime.longitude }}</td>
+                            <td style="padding:0.5rem;">
+                                <button type="button" @click="selectCrime(crime)">Select</button>
+                            </td>
+                            <td style="padding:0.5rem;">
+                                <button type="button" class="delete-btn" @click="deleteIncident(crime)">Delete</button>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -805,4 +1291,19 @@ function useMapLocationForForm() {
     opacity: 0.6;
     cursor: not-allowed;
 }
+
+.crime-row { transition: background-color .15s; }
+.crime-row.violent { background: #ffe9e6; }   /* light red */
+.crime-row.property { background: #e6f0ff; }  /* light blue */
+.crime-row.other { background: #f7f7f7; }     /* light gray */
+
+.delete-btn {
+    background: #c82333;
+    color: #fff;
+    border: 0;
+    padding: .25rem .5rem;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.delete-btn:disabled { opacity: .6; cursor: default; }
 </style>

@@ -168,8 +168,6 @@ async function initializeCrimes() {
             });
         }
         neighborhoods_by_id.value = nbhMap;
-        
-        // Populate filter lists after loading lookups
         populateFilterLists();
     } catch (err) {
         console.warn('initializeCrimes: lookup fetch failed (continuing):', err);
@@ -197,14 +195,8 @@ async function initializeCrimes() {
         console.warn('initializeCrimes: bbox calculation failed, using defaults', e);
     }
 
-    // 3) request incidents limited to 1000 and bbox
-    const params = new URLSearchParams({
-        limit: '1000',
-        lat_min: String(south),
-        lat_max: String(north),
-        lng_min: String(west),
-        lng_max: String(east)
-    });
+    // 3) request incidents (API may not support bbox filtering; do bbox filtering client-side)
+    const params = new URLSearchParams({ limit: '1000' });
     const url = `${base}/incidents?${params.toString()}`;
     console.info('initializeCrimes: requesting', url);
 
@@ -231,8 +223,8 @@ async function initializeCrimes() {
             };
         }).filter(r => {
             // Only show crimes that occurred within the current visible bbox (defensive)
-            if (r.latitude == null || r.longitude == null) return false;
-            if (isNaN(r.latitude) || isNaN(r.longitude)) return false;
+            if (r.latitude == null || r.longitude == null) return true;
+            if (r.latitude != null && r.longitude != null && (isNaN(r.latitude) || isNaN(r.longitude))) return false;
             return r.latitude >= south && r.latitude <= north && r.longitude >= west && r.longitude <= east;
         });
 
@@ -551,29 +543,41 @@ async function submitIncident() {
     incident_form_submitting.value = true;
     
     try {
-        // Prepare incident data
-        const incidentData = {
+        // Prepare incident data mapped to server's expected shape
+        const base = String(crime_url.value).replace(/\/$/, '');
+
+        // Reverse lookup for neighborhood id (neighborhoods_by_id maps id -> name)
+        const nameToId = {};
+        Object.entries(neighborhoods_by_id.value || {}).forEach(([id, name]) => { nameToId[name] = id; });
+
+        const neighborhood_number = nameToId[incident_form.neighborhood] || (incident_form.neighborhood && !isNaN(Number(incident_form.neighborhood)) ? String(incident_form.neighborhood) : '1');
+
+        // Ensure required server fields exist. Generate a case_number if none provided.
+        const case_number = incident_form.case_number || `cn-${Date.now()}`;
+
+        const payload = {
+            case_number: case_number,
             date: incident_form.date,
             time: incident_form.time,
-            address: incident_form.address,
-            latitude: parseFloat(incident_form.latitude),
-            longitude: parseFloat(incident_form.longitude),
-            crime_code: incident_form.crime_code,
-            description: incident_form.description,
-            neighborhood: incident_form.neighborhood
+            code: incident_form.crime_code,
+            incident: incident_form.description,
+            police_grid: incident_form.police_grid || 1,
+            neighborhood_number: neighborhood_number,
+            block: incident_form.address || ''
         };
-        
-        // Make PUT request
-        const response = await fetch(crime_url.value, {
+
+        // Make PUT request to server's /new-incident endpoint
+        const response = await fetch(`${base}/new-incident`, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify(incidentData)
+            body: JSON.stringify(payload)
         });
-        
+
         if (!response.ok) {
-            throw new Error(`Server error: ${response.status} ${response.statusText}`);
+            const text = await response.text().catch(() => '');
+            throw new Error(`Server error: ${response.status} ${response.statusText} ${text}`);
         }
         
         // Success - reset form and show success message
@@ -691,7 +695,8 @@ async function refreshCrimesWithFilters() {
         .filter(([name, checked]) => checked && nameToId[name])
         .map(([name]) => nameToId[name]);
     if (selectedNeighborhoodIds.length) params.append('neighborhood', selectedNeighborhoodIds.join(','));
-
+    console.log(params);
+    console.log(params.toString());
     const url = `${base}/incidents?${params.toString()}`;
     console.info('refreshCrimesWithFilters requesting', url);
 
@@ -716,8 +721,8 @@ async function refreshCrimesWithFilters() {
                 raw: i
             };
         }).filter(r => {
-            if (r.latitude == null || r.longitude == null) return false;
-            if (isNaN(r.latitude) || isNaN(r.longitude)) return false;
+            if (r.latitude == null || r.longitude == null) return true;
+            if (r.latitude != null && r.longitude != null && (isNaN(r.latitude) || isNaN(r.longitude))) return false;
             return r.latitude >= south && r.latitude <= north && r.longitude >= west && r.longitude <= east;
         });
 
@@ -756,7 +761,6 @@ function resetFilters() {
     filters.end_date = '';
     filters.max_incidents = 1000;
 }
-
 // Draw markers for neighborhoods (only for neighborhoods that have crimes or are in the lookup)
 function drawNeighborhoodMarkers() {
     if (!map.leaflet || !Array.isArray(map.neighborhood_markers)) return;
@@ -1033,6 +1037,25 @@ async function deleteIncident(crime) {
 
         <div class="grid-x grid-padding-x">
             <div class="cell small-12">
+                            <!-- Crime Category Legend -->
+                <div style="padding:1rem; background:#fff; border:1px solid #ddd; margin-bottom:1rem; border-radius:4px;">
+                    <h4 style="margin:0 0 0.5rem 0;">Crime Category Legend</h4>
+                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#ffe9e6; border:1px solid #ccc;"></div>
+                            <span>Violent Crimes</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#e6f0ff; border:1px solid #ccc;"></div>
+                            <span>Property Crimes</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="width:20px; height:20px; background:#f7f7f7; border:1px solid #ccc;"></div>
+                            <span>Other Crimes</span>
+                        </div>
+                    </div>
+                </div>
+                
                 <div class="incident-form-container">
                     <h2 class="incident-form-header">New Incident Upload Form</h2>
                     
@@ -1172,25 +1195,6 @@ async function deleteIncident(crime) {
 
         <div class="grid-x grid-padding-x">
             <div class="cell small-12">
-                <!-- Crime Category Legend -->
-                <div style="padding:1rem; background:#fff; border:1px solid #ddd; margin-bottom:1rem; border-radius:4px;">
-                    <h4 style="margin:0 0 0.5rem 0;">Crime Category Legend</h4>
-                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
-                        <div style="display:flex; align-items:center; gap:0.5rem;">
-                            <div style="width:20px; height:20px; background:#ffe9e6; border:1px solid #ccc;"></div>
-                            <span>Violent Crimes</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:0.5rem;">
-                            <div style="width:20px; height:20px; background:#e6f0ff; border:1px solid #ccc;"></div>
-                            <span>Property Crimes</span>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:0.5rem;">
-                            <div style="width:20px; height:20px; background:#f7f7f7; border:1px solid #ccc;"></div>
-                            <span>Other Crimes</span>
-                        </div>
-                    </div>
-                </div>
-                
                 <table class="crime-table" style="width:100%; border-collapse:collapse;">
                     <thead>
                         <tr style="background-color:#f2f2f2; font-weight:bold;">
@@ -1361,7 +1365,7 @@ async function deleteIncident(crime) {
     display: block;
     color: #D32323;
     font-size: 0.875rem;
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.75rem;   
 }
 
 .submit-button {

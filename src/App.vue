@@ -963,6 +963,9 @@ async function deleteIncident(crime) {
 </script>
 
 <template>
+    <a href="../about.html" target="_blank" rel="noopener noreferrer" id="center">
+        <button id="center">About Our Project</button>
+    </a>
     <dialog id="rest-dialog" open>
         <h1 class="dialog-header">St. Paul Crime REST API</h1>
         <label class="dialog-label">URL: </label>

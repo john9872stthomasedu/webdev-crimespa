@@ -550,21 +550,29 @@ async function submitIncident() {
         const nameToId = {};
         Object.entries(neighborhoods_by_id.value || {}).forEach(([id, name]) => { nameToId[name] = id; });
 
-        const neighborhood_number = nameToId[incident_form.neighborhood] || (incident_form.neighborhood && !isNaN(Number(incident_form.neighborhood)) ? String(incident_form.neighborhood) : '1');
+        // Prefer exact id lookup, otherwise accept a numeric input; default to 1.
+        let neighborhood_number_raw = nameToId[incident_form.neighborhood] ?? incident_form.neighborhood;
+        if (neighborhood_number_raw == null || neighborhood_number_raw === '') neighborhood_number_raw = '1';
+
+        // Ensure we send values as strings so the server's "!field" checks don't fail for 0
+        const neighborhood_number = String(neighborhood_number_raw);
+        const police_grid = String(incident_form.police_grid ?? 1);
 
         // Ensure required server fields exist. Generate a case_number if none provided.
         const case_number = incident_form.case_number || `cn-${Date.now()}`;
 
         const payload = {
-            case_number: case_number,
-            date: incident_form.date,
-            time: incident_form.time,
-            code: incident_form.crime_code,
-            incident: incident_form.description,
-            police_grid: incident_form.police_grid || 1,
+            case_number: String(case_number),
+            date: String(incident_form.date),
+            time: String(incident_form.time),
+            code: String(incident_form.crime_code),
+            incident: String(incident_form.description),
+            police_grid: police_grid,
             neighborhood_number: neighborhood_number,
-            block: incident_form.address || ''
+            block: String(incident_form.address || '')
         };
+
+        console.debug('Submitting incident payload:', payload);
 
         // Make PUT request to server's /new-incident endpoint
         const response = await fetch(`${base}/new-incident`, {
@@ -577,6 +585,7 @@ async function submitIncident() {
 
         if (!response.ok) {
             const text = await response.text().catch(() => '');
+            console.error('Server responded with error:', response.status, response.statusText, text);
             throw new Error(`Server error: ${response.status} ${response.statusText} ${text}`);
         }
         
@@ -808,7 +817,9 @@ let selected_crime_id = ref(null);
 function sanitizeAddressNumber(addr) {
     if (!addr || typeof addr !== 'string') return addr;
     // Replace single 'X' immediately after leading digits: "98X UNIVERSITY AV W" -> "980 UNIVERSITY AV W"
-    return addr.replace(/^(\d+)X(?=\b| )/, '$10');
+    // Only replace a single trailing X after the leading number when it's followed by a space
+    // (handles both 'X' and 'x'). e.g. "98X UNIVERSITY AV W" -> "980 UNIVERSITY AV W"
+    return addr.replace(/^(\d+)[Xx](?=\s)/, '$10');
 }
 
 // categorize crimes (simple keyword-based)
@@ -1203,8 +1214,7 @@ async function deleteIncident(crime) {
                             <th style="padding:0.5rem; text-align:left;">Incident Type</th>
                             <th style="padding:0.5rem; text-align:left;">Neighborhood</th>
                             <th style="padding:0.5rem; text-align:left;">Block</th>
-                            <th style="padding:0.5rem; text-align:left;">Latitude</th>
-                            <th style="padding:0.5rem; text-align:left;">Longitude</th>
+                            
                             <th style="padding:0.5rem; text-align:left;">Select</th>
                             <th style="padding:0.5rem; text-align:left;">Delete</th>
                         </tr>
@@ -1217,8 +1227,7 @@ async function deleteIncident(crime) {
                             <td style="padding:0.5rem;">{{ crime.incident_type }}</td>
                             <td style="padding:0.5rem;">{{ crime.neighborhood_name }}</td>
                             <td style="padding:0.5rem;">{{ crime.block }}</td>
-                            <td style="padding:0.5rem;">{{ crime.latitude }}</td>
-                            <td style="padding:0.5rem;">{{ crime.longitude }}</td>
+                            
                             <td style="padding:0.5rem;">
                                 <button type="button" @click="selectCrime(crime)">Select</button>
                             </td>
